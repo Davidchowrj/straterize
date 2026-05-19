@@ -1,54 +1,74 @@
-import { db } from "#/lib/db/client";
-import { stravaTokens, users } from "#/lib/db/schema";
-import { exchangeToken } from "#/lib/strava";
 import { createFileRoute, redirect } from "@tanstack/react-router";
-import { createServerFn } from "node_modules/@tanstack/start-client-core/dist/esm/createServerFn";
+import { createServerFn } from "@tanstack/react-start";
+import { getRequest, setCookie } from "@tanstack/react-start/server";
 import { eq } from "drizzle-orm";
+import { db } from "#/lib/db/client";
+import { users, stravaTokens, authUsers } from "#/lib/db/schema";
+import { exchangeToken } from "#/lib/strava";
 import { auth } from "#/lib/auth";
 
-const handleCallback = createServerFn({
-  method: "GET",
-})
-  .inputValidator((data: unknown) => {
-    const params = data as Record<string, string>;
+const handleCallback = createServerFn().handler(async () => {
+  const request = getRequest();
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
 
-    if (!params.code) {
-      throw new Error("No code in callback");
-    }
+  if (!code) {
+    throw redirect({ to: "/", search: { error: "missing_code" } });
+  }
 
-    return params.code as string;
-  })
-  .handler(async ({ data: code }) => {
-    const tokenData = await exchangeToken(code);
-    const athlete = tokenData.athlete;
-    let userId: string;
+  // 1. Exchange code for tokens
+  let tokenData;
+  try {
+    tokenData = await exchangeToken(code);
+  } catch (e) {
+    throw redirect({ to: "/", search: { error: "token_exchange_failed" } });
+  }
 
-    const existingUser = await db
+  const athlete = tokenData.athlete;
+
+  // 2. Upsert user
+  let userId: string;
+  try {
+    const existing = await db
       .select()
       .from(users)
       .where(eq(users.stravaId, athlete.id))
       .limit(1);
 
-    if (existingUser.length > 0) {
-      userId = existingUser[0].id;
+    if (existing.length > 0) {
+      userId = existing[0].id;
     } else {
-      const newUser = await db
-        .insert(users)
-        .values({
-          id: crypto.randomUUID(),
-          stravaId: athlete.id,
-          firstName: athlete.firstName,
-          lastName: athlete.lastName,
-          avatar: athlete.profile,
-          city: athlete.city,
-          country: athlete.country,
-          createdAt: new Date(),
-        })
-        .returning();
-
-      userId = newUser[0].id;
+      userId = crypto.randomUUID();
+      await db.insert(users).values({
+        id: userId,
+        stravaId: athlete.id,
+        firstName: athlete.firstname,
+        lastName: athlete.lastname,
+        avatar: athlete.profile ?? null,
+        city: athlete.city ?? null,
+        country: athlete.country ?? null,
+        createdAt: new Date(),
+      });
     }
-    //insert tokens into db
+
+    // Ensure matching authUsers row for sessions FK
+    await db
+      .insert(authUsers)
+      .values({
+        id: userId,
+        name: `${athlete.firstname} ${athlete.lastname}`,
+        email: `strava_${athlete.id}@straterize.local`,
+        emailVerified: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoNothing();
+  } catch (e) {
+    throw redirect({ to: "/", search: { error: "db_user_failed" } });
+  }
+
+  // 3. Upsert Strava tokens
+  try {
     await db
       .insert(stravaTokens)
       .values({
@@ -57,7 +77,7 @@ const handleCallback = createServerFn({
         accessToken: tokenData.access_token,
         refreshToken: tokenData.refresh_token,
         expiresAt: tokenData.expires_at,
-        scope: "read,activity:read",
+        scope: "read,activity:read_all",
       })
       .onConflictDoUpdate({
         target: stravaTokens.userId,
@@ -67,20 +87,31 @@ const handleCallback = createServerFn({
           expiresAt: tokenData.expires_at,
         },
       });
+  } catch (e) {
+    throw redirect({ to: "/", search: { error: "db_token_failed" } });
+  }
 
-    await auth.api.signInEmail({
-      body: { userId },
-    });
+  // 4. Create session and set cookie
+  try {
+    const ctx = await auth.$context;
+    const session = await ctx.internalAdapter.createSession(userId);
+    const cookieName = ctx.authCookies.sessionToken.name;
+    const cookieAttrs = ctx.authCookies.sessionToken.attributes ?? {};
 
-    throw redirect({
-      to: "/dashboard",
+    setCookie(cookieName, session.token, {
+      ...cookieAttrs,
+      path: "/",
+      httpOnly: true,
+      sameSite: "lax",
     });
-  });
+  } catch (e) {
+    throw redirect({ to: "/", search: { error: "session_failed" } });
+  }
+
+  throw redirect({ to: "/dashboard" });
+});
 
 export const Route = createFileRoute("/auth/callback")({
-  loader: ({ location }) =>
-    handleCallback({
-      data: Object.fromEntries(new URLSearchParams(location.search)),
-    }),
-  component: () => <div>Connecting to Strava</div>,
+  loader: () => handleCallback(),
+  component: () => null,
 });

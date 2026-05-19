@@ -2,8 +2,8 @@ const STRAVA_BASE_URL = "https://www.strava.com/api/v3";
 
 export type StravaAthelete = {
   id: number;
-  firstName: string;
-  lastName: string;
+  firstname: string;
+  lastname: string;
   profile: string;
   city: string;
   country: string;
